@@ -2,7 +2,6 @@ import re
 import PyPDF2
 
 
-
 def extract_code_from_pdf(file_path):
     """Извлекает код дисциплины из PDF файла"""
     with open(file_path, 'rb') as file:
@@ -52,5 +51,38 @@ def process_filename(filename, code, file_path):
         return f"РПД {code} {discipline}.pdf"
 
 
+def is_already_renamed(filename, code, file_path):
+    """
+    Проверка названия на соответствие целевому формату
+    """
+    # Если код не передан, пытаемся извлечь его из имени файла
+    if code is None:
+        # Проверяем оба возможных формата: с РПД и без
+        patterns = [
+            r'^РПД ([А-Я]\d+\.[А-Я][\w.]*\d+) .+\.pdf$',
+            r'^([А-Я]\d+\.[А-Я][\w.]*\d+) .+\.pdf$',
+            r'^РПД ФТД\.\d+ .+\.pdf$',
+            r'^ФТД\.\d+ .+\.pdf$'
+        ]
+        for pattern in patterns:
+            if re.match(pattern, filename, re.IGNORECASE):
+                return True
+        return False
 
+    # Остальная логика проверки с переданным кодом...
+    discipline = extract_discipline_name(filename)
+    if not discipline:
+        return False
 
+    discipline = discipline.replace('_', ' ')
+    discipline = re.sub(r"\s+", " ", discipline).strip()
+
+    if 'annot' in file_path.lower() or 'аннот' in file_path.lower():
+        target_pattern = f'{code} {discipline}'
+    else:
+        target_pattern = f'РПД {code} {discipline}'
+
+    base_match = filename.startswith(target_pattern + '.pdf')
+    duplicate_match = re.match(re.escape(target_pattern) + r' \(\d+\)\.pdf', filename)
+
+    return base_match or bool(duplicate_match)
