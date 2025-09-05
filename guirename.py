@@ -4,8 +4,66 @@ import dearpygui.dearpygui as dpg
 from config import Config
 import main
 import locale
+import ctypes
+from ctypes import wintypes, windll, Structure, POINTER, byref, c_void_p
 
 
+def browse_for_folder_ctypes():
+    """Исправленная реализация выбора папки через ctypes"""
+    # Константы
+    BIF_RETURNONLYFSDIRS = 0x00000001
+    BIF_NEWDIALOGSTYLE = 0x00000040
+
+    # Загружаем необходимые библиотеки
+    ole32 = windll.ole32
+    shell32 = windll.shell32
+
+    # Определяем структуры
+    class BROWSEINFO(Structure):
+        _fields_ = [
+            ("hwndOwner", wintypes.HWND),
+            ("pidlRoot", c_void_p),
+            ("pszDisplayName", wintypes.LPWSTR),
+            ("lpszTitle", wintypes.LPCWSTR),
+            ("ulFlags", wintypes.UINT),
+            ("lpfn", c_void_p),
+            ("lParam", c_void_p),
+            ("iImage", ctypes.c_int),
+        ]
+
+    # Указываем правильные типы для функций
+    shell32.SHBrowseForFolderW.argtypes = [POINTER(BROWSEINFO)]
+    shell32.SHBrowseForFolderW.restype = c_void_p
+
+    shell32.SHGetPathFromIDListW.argtypes = [c_void_p, wintypes.LPWSTR]
+    shell32.SHGetPathFromIDListW.restype = wintypes.BOOL
+
+    ole32.CoTaskMemFree.argtypes = [c_void_p]
+    ole32.CoTaskMemFree.restype = None
+
+    # Создаем и заполняем структуру
+    bi = BROWSEINFO()
+    bi.lpszTitle = "Выберите папку с PDF файлами"
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE
+
+    # Вызываем диалог
+    pidl = shell32.SHBrowseForFolderW(byref(bi))
+    if pidl:
+        path_buffer = ctypes.create_unicode_buffer(wintypes.MAX_PATH)
+        if shell32.SHGetPathFromIDListW(pidl, path_buffer):
+            ole32.CoTaskMemFree(pidl)
+            return path_buffer.value
+        ole32.CoTaskMemFree(pidl)
+
+    return None
+
+
+# В классе MainWindow замените метод _open_system_file_dialog на:
+def _open_system_file_dialog(self):
+    """Открывает системный диалог выбора папки через Win32 API"""
+    folder_path = browse_for_folder_ctypes()
+    if folder_path:
+        dpg.set_value('input_path', folder_path)
 
 class MainWindow:
     def __init__(self, config: Config, main_process: main):
@@ -15,6 +73,15 @@ class MainWindow:
         self.find_files = None
         self.complete_files = None
         self.error_files = None
+        self.skipped_files = None
+
+
+    @staticmethod
+    def _open_system_file_dialog():
+        """ Открытие системного файлового диалога выбора папки"""
+        folder_path = browse_for_folder_ctypes()
+        if folder_path:
+            dpg.set_value('input_path', folder_path)
 
     def setup_font_theme(self):
         font_path = self.config.PATH_FONT
@@ -27,11 +94,12 @@ class MainWindow:
 
     @staticmethod
     def _selector_callback(sender, app_data):
-        print('/' * 75)
-        print('OK was clicked')
-        print(f'sender: {sender}')
-        print(f'AppData: {app_data}')
-        dpg.set_value('input_path', app_data['file_path_name'])
+        # print('/' * 75)
+        # print('OK was clicked')
+        # print(f'sender: {sender}')
+        # print(f'AppData: {app_data}')
+        # dpg.set_value('input_path', app_data['file_path_name'])
+        pass
 
     # @staticmethod
     # def _cancel_selector_callback(sender, app_data):
@@ -55,16 +123,18 @@ class MainWindow:
             for row in rows:
                 dpg.delete_item(row)
 
-        self.complete_files, self.error_files, self.find_files = self.rename_files(directory)
+        self.complete_files, self.error_files, self.find_files, self.skipped_files = self.rename_files(directory)
         dpg.set_value('all_files_text_id', f'Найдено файлов: {self.find_files}')
         dpg.set_value('completed_files_text_id', f'Завершено: {self.complete_files}')
         dpg.set_value('error_files_text_id', f'Ошибок: {self.error_files}')
+        dpg.set_value('skipped_files_text_id', f'Пропущено: {self.skipped_files}')
 
     def rename_files(self, directory):
         """Основная функция переименования файлов"""
         find_files = 0
         renamed_count = 0
         error_count = 0
+        skipped_count = 0
 
         for filename in os.listdir(directory):
             if not filename.lower().endswith('.pdf'):
@@ -72,13 +142,19 @@ class MainWindow:
 
             file_path = os.path.join(directory, filename)
             current_time = datetime.datetime.now().strftime("%H:%M:%S")
+            find_files += 1
+
+            # Проверяем, не переименован ли уже файл
+            if self.main_process.is_already_renamed(filename, None, file_path):
+                self.add_table_row(filename, "пропущен", current_time, "Уже переименован")
+                skipped_count += 1
+                continue
 
             try:
                 # Извлекаем код из PDF
                 code = self.main_process.extract_code_from_pdf(file_path)
                 if not code:
                     self.add_table_row(filename, "ошибка", current_time, "Не найден код")
-                    find_files += 1
                     error_count += 1
                     continue
 
@@ -86,7 +162,6 @@ class MainWindow:
                 new_name = self.main_process.process_filename(filename, code, file_path)
                 if not new_name:
                     self.add_table_row(filename, "ошибка", current_time, "Не удалось извлечь название")
-                    find_files += 1
                     error_count += 1
                     continue
 
@@ -101,17 +176,15 @@ class MainWindow:
                     counter += 1
 
                 os.rename(file_path, new_path)
-                self.add_table_row(filename, "готово", current_time, f"Изменено")
-                find_files += 1
+                self.add_table_row(filename, "готово", current_time, f"Изменено на {new_name}")
                 renamed_count += 1
 
             except Exception as e:
                 current_time = datetime.datetime.now().strftime("%H:%M:%S")
                 self.add_table_row(filename, "ошибка", current_time, str(e))
-                find_files += 1
                 error_count += 1
 
-        return renamed_count, error_count, find_files
+        return renamed_count, error_count, find_files, skipped_count
 
     def create_main(self):
         try:
@@ -131,24 +204,30 @@ class MainWindow:
             with dpg.theme_component(dpg.mvText):
                 dpg.add_theme_color(dpg.mvThemeCol_Text, (255, 0, 0, 255))
 
+
+        with dpg.theme() as status_skip_theme:
+            with dpg.theme_component(dpg.mvText):
+                dpg.add_theme_color(dpg.mvThemeCol_Text, (255, 165, 0 , 255))
+
         self.status_themes = {
             'готово': status_ready_theme,
-            'ошибка': status_error_theme
+            'ошибка': status_error_theme,
+            'пропущен': status_skip_theme
         }
 
-        with dpg.file_dialog(directory_selector=True,
-                             show=False,
-                             tag='file_dialog_id',
-                             callback=self._selector_callback,
-                             # cancel_callback=self._cancel_selector_callback,
-                             width=self.config.MAX_SIZE_WIDTH / 2,
-                             height=self.config.MAX_SIZE_HEIGHT / 1.75,
-                             ):
-            dpg.add_file_extension(".*")
-            dpg.add_file_extension('', color=(255, 155, 78, 255))
-            dpg.add_file_extension('.pdf', color=(0, 255, 0))
+        # with dpg.file_dialog(directory_selector=True,
+        #                      show=False,
+        #                      tag='file_dialog_id',
+        #                      callback=self._selector_callback,
+        #                      # cancel_callback=self._cancel_selector_callback,
+        #                      width=self.config.MAX_SIZE_WIDTH / 2,
+        #                      height=self.config.MAX_SIZE_HEIGHT / 1.75,
+        #                      ):
+        #     dpg.add_file_extension(".*")
+        #     dpg.add_file_extension('', color=(255, 155, 78, 255))
+        #     dpg.add_file_extension('.pdf', color=(0, 255, 0))
 
-        dpg.create_viewport(title='GUI for renaming v3.0.0',
+        dpg.create_viewport(title='GUI for renaming v3.2.0',
                             width=self.config.MAX_SIZE_WIDTH,
                             height=self.config.MAX_SIZE_HEIGHT)
 
@@ -167,7 +246,7 @@ class MainWindow:
                                tag='input_path')
 
             dpg.add_button(label='Выбрать путь',
-                           callback=lambda: dpg.show_item('file_dialog_id'),
+                           callback=self._open_system_file_dialog,
                            pos=[self.config.MAX_SIZE_WIDTH - 175, self.config.MAX_SIZE_HEIGHT - 140],
                            width=self.config.MAX_SIZE_BTN_WIDTH,
                            height=self.config.MAX_SIZE_BTN_HEIGHT)
@@ -204,6 +283,7 @@ class MainWindow:
             dpg.add_text(f'Завершено: {0 if self.complete_files is None else self.complete_files}',
                          tag='completed_files_text_id')
             dpg.add_text(f'Ошибок: {0 if self.error_files is None else self.error_files}', tag='error_files_text_id')
+            dpg.add_text(f'Пропущено: {0 if self.skipped_files is None else self.skipped_files}', tag='skipped_files_text_id')
 
         dpg.setup_dearpygui()
         dpg.show_viewport()
@@ -228,6 +308,7 @@ def mainloop():
     main_process = main
     main_wind = MainWindow(config, main_process)
     main_wind.create_main()
+
 
 
 if __name__ == '__main__':
